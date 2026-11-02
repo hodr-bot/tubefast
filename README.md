@@ -92,6 +92,15 @@ xattr -dr com.apple.quarantine /Applications/Tubefast.app
   tubefast/install.sh
   ```
 
+- **With Nix** (any distro with Nix, no sudo needed):
+
+  ```sh
+  nix run github:hodr-bot/tubefast
+  ```
+
+  Or keep it installed in your profile: `nix profile install github:hodr-bot/tubefast#tubefast`.
+  The `flake.nix` at the root of this repo builds Tubefast from source with Nix (all dependencies included, no system packages needed).
+
 You can check that a download was built from this repository by GitHub, not by anyone else:
 
 ```sh
