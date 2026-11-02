@@ -612,12 +612,8 @@ fn decode_loop(
                             let queue = shared.queue.lock().unwrap();
                             let at = queue.ids.iter().position(|id| *id == video_id);
                             match at {
-                                Some(i) if i + 1 < queue.ids.len() => {
-                                    Some(queue.ids[i + 1].clone())
-                                }
-                                _ if queue.repeat == 1 && !queue.ids.is_empty() => {
-                                    Some(queue.ids[0].clone())
-                                }
+                                Some(i) if i + 1 < queue.ids.len() => Some(queue.ids[i + 1].clone()),
+                                _ if queue.repeat == 1 && !queue.ids.is_empty() => Some(queue.ids[0].clone()),
                                 _ => None,
                             }
                         };
@@ -637,23 +633,17 @@ fn decode_loop(
                             let warm_id = next_id.clone();
                             // The UI thread usually preloads the stream after
                             // that, but it may be stalled in the background.
-                            let (warm_yt, warm_urls, warm_shared) =
-                                (yt.clone(), urls.clone(), shared.clone());
-                            let (replies, shared, yt, urls) =
-                                (replies.clone(), shared.clone(), yt.clone(), urls.clone());
+                            let (warm_yt, warm_urls, warm_shared) = (yt.clone(), urls.clone(), shared.clone());
+                            let (replies, shared, yt, urls) = (replies.clone(), shared.clone(), yt.clone(), urls.clone());
                             std::thread::spawn(move || {
-                                let opened =
-                                    Track::open(&yt, &urls, &next_id, generation, &shared)
-                                        .or_else(|message| {
-                                            urls.lock().unwrap().remove(&next_id);
-                                            if shared.generation.load(Relaxed) == generation
-                                                && yt.refresh_clients()
-                                            {
-                                                Track::open(&yt, &urls, &next_id, generation, &shared)
-                                            } else {
-                                                Err(message)
-                                            }
-                                        });
+                                let opened = Track::open(&yt, &urls, &next_id, generation, &shared).or_else(|message| {
+                                    urls.lock().unwrap().remove(&next_id);
+                                    if shared.generation.load(Relaxed) == generation && yt.refresh_clients() {
+                                        Track::open(&yt, &urls, &next_id, generation, &shared)
+                                    } else {
+                                        Err(message)
+                                    }
+                                });
                                 let reply = match opened {
                                     Ok(track) => Cmd::Opened(track),
                                     Err(message) => {
@@ -822,10 +812,7 @@ impl Player {
     /// hidden window stops eframe redraws on Wayland). `repeat`: 0 = off,
     /// 1 = repeat all, 2 = repeat one.
     pub fn set_queue(&self, ids: &[String], repeat: u8) {
-        *self.shared.queue.lock().unwrap() = Queue {
-            ids: ids.to_vec(),
-            repeat,
-        };
+        *self.shared.queue.lock().unwrap() = Queue { ids: ids.to_vec(), repeat };
     }
 
     /// Video id the decode thread is currently on (or loading).
