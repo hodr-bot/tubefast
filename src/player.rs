@@ -47,6 +47,18 @@ struct Shared {
     paused: AtomicBool,
     ended: AtomicBool,
     error: Mutex<Option<String>>,
+    current_id: Mutex<String>,
+    queue: Mutex<Queue>,
+}
+
+/// Snapshot of the UI queue so the decode thread can advance on its own
+/// when the UI thread is stalled (a minimised or hidden window stops
+/// eframe redraws on Wayland, which used to gate every auto-advance).
+#[derive(Default)]
+struct Queue {
+    ids: Vec<String>,
+    /// 0 = off, 1 = repeat all, 2 = repeat one.
+    repeat: u8,
 }
 
 struct Chunk {
@@ -577,18 +589,109 @@ fn decode_loop(
         let Some(playing) = track.as_mut().filter(|t| !t.finished) else {
             continue;
         };
+        let mut advanced = false;
         match playing.next_chunk(epoch) {
             Ok(Some(chunk)) => pending = Some(chunk),
             Ok(None) => {
                 playing.finished = true;
-                pending = Some(Chunk {
-                    samples: Vec::new(),
-                    start_ms: 0,
-                    epoch,
-                    rate: 0,
-                    channels: 0,
-                    end: true,
-                });
+                if current(playing.generation) {
+                    let video_id = playing.video_id.clone();
+                    if shared.queue.lock().unwrap().repeat == 2 {
+                        // Repeat-one: restart the same track right here instead
+                        // of waiting for a UI frame that may never come.
+                        epoch = shared.epoch.fetch_add(1, Relaxed) + 1;
+                        pending = None;
+                        playing.seek(0);
+                        if !playing.finished {
+                            shared.position_ms.store(0, Relaxed);
+                            shared.ended.store(false, Relaxed);
+                            wake();
+                        }
+                    } else {
+                        let next = {
+                            let queue = shared.queue.lock().unwrap();
+                            let at = queue.ids.iter().position(|id| *id == video_id);
+                            match at {
+                                Some(i) if i + 1 < queue.ids.len() => {
+                                    Some(queue.ids[i + 1].clone())
+                                }
+                                _ if queue.repeat == 1 && !queue.ids.is_empty() => {
+                                    Some(queue.ids[0].clone())
+                                }
+                                _ => None,
+                            }
+                        };
+                        if let Some(next_id) = next {
+                            let generation = shared.generation.fetch_add(1, Relaxed) + 1;
+                            epoch = shared.epoch.fetch_add(1, Relaxed) + 1;
+                            pending = None;
+                            resume = None;
+                            shared.position_ms.store(0, Relaxed);
+                            shared.duration_ms.store(0, Relaxed);
+                            shared.buffered.store(0, Relaxed);
+                            shared.ended.store(false, Relaxed);
+                            shared.loading.store(true, Relaxed);
+                            shared.error.lock().unwrap().take();
+                            *shared.current_id.lock().unwrap() = next_id.clone();
+                            wake();
+                            let warm_id = next_id.clone();
+                            // The UI thread usually preloads the stream after
+                            // that, but it may be stalled in the background.
+                            let (warm_yt, warm_urls, warm_shared) =
+                                (yt.clone(), urls.clone(), shared.clone());
+                            let (replies, shared, yt, urls) =
+                                (replies.clone(), shared.clone(), yt.clone(), urls.clone());
+                            std::thread::spawn(move || {
+                                let opened =
+                                    Track::open(&yt, &urls, &next_id, generation, &shared)
+                                        .or_else(|message| {
+                                            urls.lock().unwrap().remove(&next_id);
+                                            if shared.generation.load(Relaxed) == generation
+                                                && yt.refresh_clients()
+                                            {
+                                                Track::open(&yt, &urls, &next_id, generation, &shared)
+                                            } else {
+                                                Err(message)
+                                            }
+                                        });
+                                let reply = match opened {
+                                    Ok(track) => Cmd::Opened(track),
+                                    Err(message) => {
+                                        urls.lock().unwrap().remove(&next_id);
+                                        Cmd::Failed { generation, message }
+                                    }
+                                };
+                                let _ = replies.send(reply);
+                            });
+                            // The UI thread usually preloads the stream after
+                            // that, but it may be stalled in the background.
+                            std::thread::spawn(move || {
+                                let follow = {
+                                    let queue = warm_shared.queue.lock().unwrap();
+                                    queue
+                                        .ids
+                                        .iter()
+                                        .position(|id| *id == warm_id)
+                                        .and_then(|i| queue.ids.get(i + 1).cloned())
+                                };
+                                if let Some(id) = follow {
+                                    let _ = resolve(&warm_yt, &warm_urls, &id);
+                                }
+                            });
+                            advanced = true;
+                        }
+                    }
+                }
+                if !advanced && playing.finished {
+                    pending = Some(Chunk {
+                        samples: Vec::new(),
+                        start_ms: 0,
+                        epoch,
+                        rate: 0,
+                        channels: 0,
+                        end: true,
+                    });
+                }
             }
             Err(message) => {
                 if current(playing.generation) {
@@ -598,6 +701,9 @@ fn decode_loop(
                 }
                 track = None;
             }
+        }
+        if advanced {
+            track = None;
         }
     }
 }
@@ -697,6 +803,7 @@ impl Player {
         self.shared.ended.store(false, Relaxed);
         self.shared.loading.store(true, Relaxed);
         self.shared.error.lock().unwrap().take();
+        *self.shared.current_id.lock().unwrap() = video_id.to_owned();
         let _ = self.commands.send(Cmd::Load {
             video_id: video_id.to_owned(),
             generation,
@@ -708,6 +815,22 @@ impl Player {
     pub fn preload(&self, video_id: &str) {
         let (yt, urls, video_id) = (self.yt.clone(), self.urls.clone(), video_id.to_owned());
         std::thread::spawn(move || resolve(&yt, &urls, &video_id));
+    }
+
+    /// Shares the UI queue with the decode thread so it can chain to the
+    /// next track on its own when the UI thread is stalled (a minimised or
+    /// hidden window stops eframe redraws on Wayland). `repeat`: 0 = off,
+    /// 1 = repeat all, 2 = repeat one.
+    pub fn set_queue(&self, ids: &[String], repeat: u8) {
+        *self.shared.queue.lock().unwrap() = Queue {
+            ids: ids.to_vec(),
+            repeat,
+        };
+    }
+
+    /// Video id the decode thread is currently on (or loading).
+    pub fn chained_id(&self) -> String {
+        self.shared.current_id.lock().unwrap().clone()
     }
 
     pub fn seek(&self, ms: u64) {

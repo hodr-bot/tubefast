@@ -623,6 +623,10 @@ impl App {
         self.resume_at = None;
         self.saved.current = Some(index);
         self.player.load(&item.video_id);
+        self.track_changed(&item, index);
+    }
+
+    fn track_changed(&mut self, item: &Item, index: usize) {
         if let Some(next) = self.saved.queue.get(index + 1) {
             self.player.preload(&next.video_id);
         }
@@ -637,8 +641,35 @@ impl App {
             });
         }
         self.saved.recent.retain(|recent| recent.video_id != item.video_id);
-        self.saved.recent.insert(0, item);
+        self.saved.recent.insert(0, item.clone());
         self.saved.recent.truncate(RECENT_LIMIT);
+    }
+
+    /// Mirrors an advance the decode thread made on its own while this
+    /// thread was stalled (hidden window): moves the queue index without
+    /// reloading, so the UI resynchronises on the next frame.
+    fn follow_player(&mut self) {
+        let id = self.player.chained_id();
+        if id.is_empty() {
+            return;
+        }
+        if self.now_playing().is_some_and(|item| item.video_id == id) {
+            return;
+        }
+        let Some(index) = self.saved.queue.iter().position(|item| item.video_id == id) else {
+            return;
+        };
+        let played = if self.saved.repeat == Repeat::All {
+            0
+        } else {
+            index.saturating_sub(PLAYED_KEPT)
+        };
+        self.saved.queue.drain(..played);
+        let index = index - played;
+        let item = self.saved.queue[index].clone();
+        self.resume_at = None;
+        self.saved.current = Some(index);
+        self.track_changed(&item, index);
     }
 
     fn next(&mut self, automatic: bool) {
@@ -662,6 +693,10 @@ impl App {
     }
 
     fn drain(&mut self, ctx: &egui::Context) {
+        // The decode thread chains tracks on its own when this thread is
+        // stalled (hidden window); mirror its position first so relative
+        // actions (next/previous) use a fresh index.
+        self.follow_player();
         while let Ok(event) = self.events.try_recv() {
             match event {
                 Event::Part(load, order, sections) if load == self.home_load => {
@@ -786,6 +821,15 @@ impl App {
                 self.next(true);
             }
         }
+        // Keep the decode thread's queue snapshot fresh; it is what keeps
+        // playback advancing while this thread is stalled.
+        let repeat = match self.saved.repeat {
+            Repeat::Off => 0,
+            Repeat::All => 1,
+            Repeat::One => 2,
+        };
+        let ids: Vec<String> = self.saved.queue.iter().map(|item| item.video_id.clone()).collect();
+        self.player.set_queue(&ids, repeat);
         if let Some(typed) = self.typed {
             if typed.elapsed() >= SEARCH_DEBOUNCE {
                 self.typed = None;
