@@ -3,7 +3,7 @@ use crate::ytm;
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use symphonia::core::audio::SampleBuffer;
@@ -104,6 +104,8 @@ enum Cmd {
     /// Recheck the default output device, reopening when it moved.
     PollDevice,
     /// Warm the stream cache for a video id without loading it.
+    /// Sent only by the Linux MPRIS integration.
+    #[cfg(all(unix, not(target_os = "macos")))]
     Preload {
         video_id: String,
     },
@@ -563,16 +565,9 @@ fn apply_output(output: &Option<(rodio::OutputStream, rodio::Sink)>, shared: &Ar
     }
 }
 
-fn decode_loop(
-    commands: Receiver<Cmd>,
-    replies: Sender<Cmd>,
-    pcm: SyncSender<Chunk>,
-    chunks: Chunks,
-    shared: Arc<Shared>,
-    yt: Arc<ytm::Client>,
-    urls: Urls,
-    wake: Wake,
-) {
+fn decode_loop(commands: Receiver<Cmd>, replies: Sender<Cmd>, shared: Arc<Shared>, yt: Arc<ytm::Client>, urls: Urls, wake: Wake) {
+    let (pcm, chunks) = mpsc::sync_channel(QUEUED_CHUNKS);
+    let chunks: Chunks = Arc::new(Mutex::new(chunks));
     // The audio output belongs to this thread: opening it here (not on the
     // UI thread, not in shared state) is what lets pause/volume/device work
     // on every OS, including ones where the output types are not Send.
@@ -665,7 +660,10 @@ fn decode_loop(
                     None => resume = Some(ms),
                 }
             }
-            Some(Cmd::Pause { .. }) => {
+            Some(Cmd::Pause { paused }) => {
+                // The sender stores the flag too; repeating it here keeps one
+                // code path applying flag + sink together.
+                shared.paused.store(paused, Relaxed);
                 apply_output(&output, &shared);
             }
             Some(Cmd::SetVolume { volume }) => {
@@ -686,6 +684,7 @@ fn decode_loop(
                     }
                 }
             }
+            #[cfg(all(unix, not(target_os = "macos")))]
             Some(Cmd::Preload { video_id }) => {
                 let (yt, urls) = (yt.clone(), urls.clone());
                 std::thread::spawn(move || resolve(&yt, &urls, &video_id));
@@ -815,7 +814,6 @@ fn default_device() -> Option<String> {
 pub struct Player {
     commands: Sender<Cmd>,
     shared: Arc<Shared>,
-    wake: Wake,
     yt: Arc<ytm::Client>,
     urls: Urls,
 }
@@ -886,11 +884,6 @@ impl Playback {
     #[cfg(all(unix, not(target_os = "macos")))]
     pub fn paused(&self) -> bool {
         self.shared.paused.load(Relaxed)
-    }
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    pub fn playing(&self) -> bool {
-        !self.chained_id().is_empty() && !self.paused()
     }
 
     /// Set when the audio of the current track really ran out. Unlike
@@ -1023,15 +1016,13 @@ impl Player {
         });
         let urls = Urls::default();
         let (commands, inbox) = mpsc::channel();
-        let (pcm, chunks) = mpsc::sync_channel(QUEUED_CHUNKS);
-        let chunks = Arc::new(Mutex::new(chunks));
-        let worker = (commands.clone(), shared.clone(), yt.clone(), urls.clone(), wake.clone());
-        let chunks = chunks.clone();
-        std::thread::spawn(move || decode_loop(inbox, worker.0, pcm, chunks, worker.1, worker.2, worker.3, worker.4));
+        std::thread::spawn({
+            let (commands, shared, yt, urls) = (commands.clone(), shared.clone(), yt.clone(), urls.clone());
+            move || decode_loop(inbox, commands, shared, yt, urls, wake)
+        });
         Self {
             commands,
             shared,
-            wake,
             yt,
             urls,
         }

@@ -207,7 +207,7 @@ pub enum Action {
     Undo,
     GetUpdate,
     OpenRelease,
-    #[cfg_attr(not(any(windows, unix)), allow(dead_code))]
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
     Pause(bool),
     Move(usize, usize),
     Expand(bool),
@@ -292,7 +292,7 @@ impl App {
         yt.act_as(saved.account.as_ref().map_or("", |account| &account.page));
         saved.current = saved.current.filter(|current| *current < saved.queue.len());
         let ctx = cc.egui_ctx.clone();
-        let mut player = Player::new(yt.clone(), {
+        let player = Player::new(yt.clone(), {
             let ctx = ctx.clone();
             move || ctx.request_repaint()
         });
