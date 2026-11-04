@@ -21,7 +21,7 @@ const RECENT_LIMIT: usize = 100;
 const CACHED_PAGES: usize = 24;
 const PAGES_KEPT_ON_TRIM: usize = 8;
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(350);
-const RESTART_AFTER_MS: u64 = 3000;
+pub(crate) const RESTART_AFTER_MS: u64 = 3000;
 const NOTICE_TIME: Duration = Duration::from_secs(6);
 const UPDATE_NOTICE_TIME: Duration = Duration::from_secs(20);
 const LATEST_RELEASE: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "/releases/latest");
@@ -255,7 +255,6 @@ pub struct App {
     replaced: Option<(Vec<Item>, Option<usize>, u64)>,
     curated: bool,
     growing: Option<(Route, usize, usize)>,
-    resume_at: Option<u64>,
     pub sign_in: Option<SignIn>,
     pub library: Vec<Item>,
     pub accounts: Vec<Account>,
@@ -298,14 +297,20 @@ impl App {
             move || ctx.request_repaint()
         });
         player.set_volume(saved.volume);
+        player.playback().set_resume(saved.current.map(|_| saved.position_ms));
         let (sender, events) = mpsc::channel();
-        let media = Media::new(cc, {
-            let (sender, ctx) = (sender.clone(), ctx.clone());
-            move |action| {
-                let _ = sender.send(Event::Pressed(action));
-                ctx.request_repaint();
-            }
-        });
+        let control = player.playback();
+        let media = Media::new(
+            cc,
+            {
+                let (sender, ctx) = (sender.clone(), ctx.clone());
+                move |action| {
+                    let _ = sender.send(Event::Pressed(action));
+                    ctx.request_repaint();
+                }
+            },
+            control,
+        );
         // The MPRIS ticker keeps the desktop integration (covers, progress)
         // in sync while this thread is stalled in the background.
         #[cfg(all(unix, not(target_os = "macos")))]
@@ -333,7 +338,6 @@ impl App {
             replaced: None,
             curated: !saved.queue.is_empty(),
             growing: None,
-            resume_at: saved.current.map(|_| saved.position_ms),
             sign_in: None,
             library: Vec::new(),
             accounts: Vec::new(),
@@ -599,7 +603,7 @@ impl App {
                 .iter()
                 .all(|old| self.saved.queue.iter().any(|new| new.video_id == old.video_id));
         if self.curated && upcoming < before.len() && !same_list {
-            let position = self.resume_at.unwrap_or_else(|| self.player.position_ms());
+            let position = self.player.playback().resume().unwrap_or_else(|| self.player.position_ms());
             self.offer("Queue replaced", Some(("Undo", Action::Undo)), NOTICE_TIME);
             self.replaced = Some((before, self.saved.current, position));
         }
@@ -626,7 +630,7 @@ impl App {
         self.saved.queue.drain(..played);
         let index = index - played;
         let item = self.saved.queue[index].clone();
-        self.resume_at = None;
+        self.player.playback().set_resume(None);
         self.saved.current = Some(index);
         self.player.load(&item.video_id);
         self.track_changed(&item, index);
@@ -673,7 +677,7 @@ impl App {
         self.saved.queue.drain(..played);
         let index = index - played;
         let item = self.saved.queue[index].clone();
-        self.resume_at = None;
+        self.player.playback().set_resume(None);
         self.saved.current = Some(index);
         self.track_changed(&item, index);
     }
@@ -936,7 +940,7 @@ impl App {
                     }
                 }
             }
-            Action::Toggle => match (self.saved.current, self.resume_at) {
+            Action::Toggle => match (self.saved.current, self.player.playback().take_resume()) {
                 (Some(current), Some(position)) => {
                     self.play_index(current);
                     self.player.seek(position);
@@ -1135,7 +1139,7 @@ impl eframe::App for App {
             (_, false) => self.geometry = storage.get_string(WINDOW_KEY),
         }
         self.saved.visitor = self.yt.visitor();
-        self.saved.position_ms = self.resume_at.unwrap_or_else(|| self.player.position_ms());
+        self.saved.position_ms = self.player.playback().resume().unwrap_or_else(|| self.player.position_ms());
         eframe::set_value(storage, eframe::APP_KEY, &self.saved);
     }
 }

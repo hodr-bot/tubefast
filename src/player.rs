@@ -49,6 +49,13 @@ struct Shared {
     error: Mutex<Option<String>>,
     current_id: Mutex<String>,
     queue: Mutex<Queue>,
+    /// Audio output owned here (not by the UI thread) so pause/volume work
+    /// from any thread, including the MPRIS handler while the window — and
+    /// its frames — are gone.
+    output: Mutex<Option<(rodio::OutputStream, rodio::Sink)>>,
+    /// Position to resume from, set once when restoring the saved session.
+    /// Consumed by the first play, whoever triggers it (UI or MPRIS).
+    resume_at: Mutex<Option<u64>>,
 }
 
 /// Snapshot of the UI queue so the decode thread can advance on its own
@@ -708,7 +715,6 @@ fn default_device() -> Option<String> {
 pub struct Player {
     commands: Sender<Cmd>,
     shared: Arc<Shared>,
-    output: Option<(rodio::OutputStream, rodio::Sink)>,
     device: Option<String>,
     device_lost: Arc<AtomicBool>,
     device_polled: Instant,
@@ -719,18 +725,67 @@ pub struct Player {
     urls: Urls,
 }
 
-/// Thread-safe view of the playback state for background integrations
-/// (the MPRIS ticker) that must keep working while the UI thread is
-/// stalled. Everything is read from the shared state, never from the
-/// audio output owned by the UI thread. Linux only: other platforms feed
-/// their media integration from the UI thread.
-#[cfg(all(unix, not(target_os = "macos")))]
-#[derive(Clone)]
-pub struct Playback {
-    shared: Arc<Shared>,
+/// Starts a track: the single entry point whoever is asking (a UI button,
+/// an MPRIS command, the decode thread chaining on its own). Bumps the
+/// generation so stale opens are ignored, resets the shared state, and
+/// hands the open to the decode loop, which runs with or without frames.
+fn start_track(commands: &Sender<Cmd>, shared: &Arc<Shared>, video_id: &str) {
+    let generation = shared.generation.fetch_add(1, Relaxed) + 1;
+    let epoch = shared.epoch.fetch_add(1, Relaxed) + 1;
+    shared.position_ms.store(0, Relaxed);
+    shared.duration_ms.store(0, Relaxed);
+    shared.buffered.store(0, Relaxed);
+    shared.ended.store(false, Relaxed);
+    shared.loading.store(true, Relaxed);
+    shared.error.lock().unwrap().take();
+    *shared.current_id.lock().unwrap() = video_id.to_owned();
+    let _ = commands.send(Cmd::Load {
+        video_id: video_id.to_owned(),
+        generation,
+        epoch,
+    });
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+/// Applies a pause state to the flag and the sink together, from any
+/// thread. The UI and MPRIS both go through here, so they can never
+/// disagree about whether audio is playing.
+fn apply_pause(shared: &Arc<Shared>, paused: bool) {
+    shared.paused.store(paused, Relaxed);
+    if let Some((_, sink)) = shared.output.lock().unwrap().as_ref() {
+        if paused { sink.pause() } else { sink.play() }
+    }
+}
+
+/// Neighbour of `video_id` in the queue snapshot, honouring repeat-all
+/// wraparound. Repeat-one never reaches here (it restarts in place).
+/// Returns `None` past the ends when repeat is off.
+fn neighbor(queue: &Queue, video_id: &str, delta: i64) -> Option<String> {
+    let at = queue.items.iter().position(|item| item.video_id == video_id)?;
+    let len = queue.items.len() as i64;
+    let mut next = at as i64 + delta;
+    if next < 0 || next >= len {
+        if queue.repeat == 1 && len > 0 {
+            next = if delta > 0 { 0 } else { len - 1 };
+        } else {
+            return None;
+        }
+    }
+    queue.items.get(next as usize).map(|item| item.video_id.clone())
+}
+
+/// Thread-safe handle to the player for background integrations (the
+/// MPRIS handler and ticker) that must keep working while the UI thread
+/// is stalled. Reads and commands both go through the shared state and
+/// the decode loop, never through frames — the same primitives the UI
+/// buttons use, so both callers always agree.
+#[derive(Clone)]
+pub struct Playback {
+    commands: Sender<Cmd>,
+    shared: Arc<Shared>,
+    yt: Arc<ytm::Client>,
+    urls: Urls,
+}
+
 impl Playback {
     pub fn position_ms(&self) -> u64 {
         self.shared.position_ms.load(Relaxed)
@@ -742,6 +797,10 @@ impl Playback {
 
     pub fn paused(&self) -> bool {
         self.shared.paused.load(Relaxed)
+    }
+
+    pub fn playing(&self) -> bool {
+        !self.chained_id().is_empty() && !self.paused()
     }
 
     /// Set when the audio of the current track really ran out. Unlike
@@ -767,6 +826,98 @@ impl Playback {
             .find(|item| item.video_id == video_id)
             .cloned()
     }
+
+    pub fn load(&self, video_id: &str) {
+        *self.shared.resume_at.lock().unwrap() = None;
+        start_track(&self.commands, &self.shared, video_id);
+    }
+
+    pub fn seek_to(&self, ms: u64) {
+        let epoch = self.shared.epoch.fetch_add(1, Relaxed) + 1;
+        self.shared.position_ms.store(ms, Relaxed);
+        self.shared.ended.store(false, Relaxed);
+        let _ = self.commands.send(Cmd::Seek { ms, epoch });
+    }
+
+    pub fn set_paused(&self, paused: bool) {
+        apply_pause(&self.shared, paused);
+    }
+
+    /// Mirrors the UI toggle: resume a restored session once, otherwise
+    /// flip the pause state. No-op when nothing is loaded (the pending
+    /// resume is kept for whoever loads first).
+    pub fn toggle(&self) {
+        let id = self.chained_id();
+        if id.is_empty() {
+            return;
+        }
+        if let Some(position) = self.take_resume() {
+            start_track(&self.commands, &self.shared, &id);
+            self.seek_to(position);
+        } else {
+            self.set_paused(!self.paused());
+        }
+    }
+
+    /// Mirrors the UI pause command: only acts when it would change state.
+    pub fn pause(&self, paused: bool) {
+        if paused == self.playing() {
+            self.toggle();
+        }
+    }
+
+    /// Mirrors a manual next: step to the following queue item (wrapping
+    /// on repeat-all), doing nothing at the end otherwise.
+    pub fn next(&self) {
+        let id = self.chained_id();
+        let next = neighbor(&self.shared.queue.lock().unwrap(), &id, 1);
+        if let Some(next) = next {
+            self.load(&next);
+            self.preload_after(&next, 1);
+        }
+    }
+
+    /// Mirrors a manual previous: restart the track past the restart
+    /// threshold, otherwise step back (or restart at the head).
+    pub fn previous(&self) {
+        if self.chained_id().is_empty() {
+            return;
+        }
+        if self.position_ms() >= crate::app::RESTART_AFTER_MS {
+            self.seek_to(0);
+            return;
+        }
+        let id = self.chained_id();
+        let next = neighbor(&self.shared.queue.lock().unwrap(), &id, -1);
+        match next {
+            Some(prev) => self.load(&prev),
+            None => self.seek_to(0),
+        }
+    }
+
+    /// Warm the stream cache for the item after `video_id`, like the UI
+    /// does when a track changes, so background steps stay gapless.
+    fn preload_after(&self, video_id: &str, delta: i64) {
+        let next = neighbor(&self.shared.queue.lock().unwrap(), video_id, delta);
+        if let Some(id) = next {
+            let (yt, urls) = (self.yt.clone(), self.urls.clone());
+            std::thread::spawn(move || {
+                let _ = resolve(&yt, &urls, &id);
+            });
+        }
+    }
+
+    pub fn resume(&self) -> Option<u64> {
+        *self.shared.resume_at.lock().unwrap()
+    }
+
+    pub fn take_resume(&self) -> Option<u64> {
+        self.shared.resume_at.lock().unwrap().take()
+    }
+
+    pub fn set_resume(&self, position: Option<u64>) {
+        *self.shared.resume_at.lock().unwrap() = position;
+    }
 }
 
 impl Player {
@@ -781,7 +932,6 @@ impl Player {
         let mut player = Self {
             commands,
             shared,
-            output: None,
             device: None,
             device_lost: Arc::default(),
             device_polled: Instant::now(),
@@ -792,7 +942,8 @@ impl Player {
             urls,
         };
         player.open_output();
-        if player.output.is_none() {
+        if player.shared.output.lock().unwrap().is_none() {
+            player.shared.paused.store(true, Relaxed);
             *player.shared.error.lock().unwrap() = Some(NO_OUTPUT.to_owned());
         }
         player
@@ -807,7 +958,7 @@ impl Player {
         let stream = rodio::OutputStreamBuilder::from_default_device()
             .and_then(|device| device.with_error_callback(notice_loss).open_stream_or_fallback())
             .or_else(|_| rodio::OutputStreamBuilder::open_default_stream());
-        self.output = stream.ok().map(|mut stream| {
+        *self.shared.output.lock().unwrap() = stream.ok().map(|mut stream| {
             stream.log_on_drop(false);
             let sink = rodio::Sink::connect_new(stream.mixer());
             sink.pause();
@@ -816,7 +967,7 @@ impl Player {
             sink.append(PcmSource::new(self.chunks.clone(), self.shared.clone(), self.wake.clone()));
             (stream, sink)
         });
-        self.device = default_device().filter(|_| self.output.is_some());
+        self.device = default_device().filter(|_| self.shared.output.lock().unwrap().is_some());
     }
 
     pub fn follow_default_device(&mut self) {
@@ -828,29 +979,16 @@ impl Player {
             return;
         }
         let paused = self.paused();
-        let played = self.output.take().is_some();
+        let played = self.shared.output.lock().unwrap().take().is_some();
         self.open_output();
         self.set_paused(paused);
-        if played && self.output.is_none() {
+        if played && self.shared.output.lock().unwrap().is_none() {
             *self.shared.error.lock().unwrap() = Some(NO_OUTPUT.to_owned());
         }
     }
 
     pub fn load(&self, video_id: &str) {
-        let generation = self.shared.generation.fetch_add(1, Relaxed) + 1;
-        let epoch = self.shared.epoch.fetch_add(1, Relaxed) + 1;
-        self.shared.position_ms.store(0, Relaxed);
-        self.shared.duration_ms.store(0, Relaxed);
-        self.shared.buffered.store(0, Relaxed);
-        self.shared.ended.store(false, Relaxed);
-        self.shared.loading.store(true, Relaxed);
-        self.shared.error.lock().unwrap().take();
-        *self.shared.current_id.lock().unwrap() = video_id.to_owned();
-        let _ = self.commands.send(Cmd::Load {
-            video_id: video_id.to_owned(),
-            generation,
-            epoch,
-        });
+        self.playback().load(video_id);
         self.set_paused(false);
     }
 
@@ -870,14 +1008,16 @@ impl Player {
         };
     }
 
-    /// Thread-safe view of the playback state for background integrations
-    /// (the MPRIS ticker) that must keep working while the UI thread is
-    /// stalled. Everything is read from the shared state, never from the
-    /// audio output owned by the UI thread.
-    #[cfg(all(unix, not(target_os = "macos")))]
+    /// Thread-safe handle to the player for background integrations (the
+    /// MPRIS handler and ticker) that must keep working while the UI
+    /// thread is stalled. Commands go through the same primitives the
+    /// UI buttons use.
     pub fn playback(&self) -> Playback {
         Playback {
+            commands: self.commands.clone(),
             shared: self.shared.clone(),
+            yt: self.yt.clone(),
+            urls: self.urls.clone(),
         }
     }
 
@@ -887,26 +1027,20 @@ impl Player {
     }
 
     pub fn seek(&self, ms: u64) {
-        let epoch = self.shared.epoch.fetch_add(1, Relaxed) + 1;
-        self.shared.position_ms.store(ms, Relaxed);
-        self.shared.ended.store(false, Relaxed);
-        let _ = self.commands.send(Cmd::Seek { ms, epoch });
+        self.playback().seek_to(ms);
     }
 
     pub fn set_paused(&self, paused: bool) {
-        self.shared.paused.store(paused, Relaxed);
-        if let Some((_, sink)) = &self.output {
-            if paused { sink.pause() } else { sink.play() }
-        }
+        self.playback().set_paused(paused);
     }
 
     pub fn paused(&self) -> bool {
-        self.output.as_ref().is_none_or(|(_, sink)| sink.is_paused())
+        self.shared.paused.load(Relaxed)
     }
 
     pub fn set_volume(&mut self, volume: f32) {
         self.volume = volume;
-        if let Some((_, sink)) = &self.output {
+        if let Some((_, sink)) = self.shared.output.lock().unwrap().as_ref() {
             sink.set_volume(volume * volume);
         }
     }
@@ -1011,5 +1145,95 @@ mod tests {
         assert_eq!(second.by_ref().take(SILENCE_SAMPLES + 4).filter(|sample| *sample == 0.5).count(), 4);
         assert_eq!(shared.position_ms.load(Relaxed), 2000);
         assert!(queue(3000));
+    }
+
+    fn queued(ids: &str, repeat: u8) -> Queue {
+        Queue {
+            items: ids
+                .chars()
+                .map(|id| ytm::Item {
+                    video_id: id.to_string(),
+                    ..ytm::Item::default()
+                })
+                .collect(),
+            repeat,
+        }
+    }
+
+    fn playback_with(queue: Queue) -> (Playback, mpsc::Receiver<Cmd>) {
+        let shared = Arc::new(Shared::default());
+        *shared.queue.lock().unwrap() = queue;
+        let (commands, inbox) = mpsc::channel();
+        let control = Playback {
+            commands,
+            shared,
+            yt: Arc::new(ytm::Client::new(String::new())),
+            urls: Urls::default(),
+        };
+        (control, inbox)
+    }
+
+    #[test]
+    fn queue_neighbours_step_without_wrapping_when_repeat_is_off() {
+        let queue = queued("abc", 0);
+        assert_eq!(neighbor(&queue, "a", 1).as_deref(), Some("b"));
+        assert_eq!(neighbor(&queue, "b", 1).as_deref(), Some("c"));
+        assert_eq!(neighbor(&queue, "c", 1), None);
+        assert_eq!(neighbor(&queue, "c", -1).as_deref(), Some("b"));
+        assert_eq!(neighbor(&queue, "a", -1), None);
+        assert_eq!(neighbor(&queue, "zzz", 1), None);
+    }
+
+    #[test]
+    fn queue_neighbours_wrap_around_on_repeat_all() {
+        let queue = queued("abc", 1);
+        assert_eq!(neighbor(&queue, "c", 1).as_deref(), Some("a"));
+        assert_eq!(neighbor(&queue, "a", -1).as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn next_loads_the_following_item_and_preloads_the_one_after() {
+        let (control, inbox) = playback_with(queued("abc", 0));
+        *control.shared.current_id.lock().unwrap() = "a".to_owned();
+        control.next();
+        match inbox.try_recv() {
+            Ok(Cmd::Load { video_id, .. }) => assert_eq!(video_id, "b"),
+            _ => panic!("expected a load of b"),
+        }
+        assert_eq!(*control.shared.current_id.lock().unwrap(), "b");
+    }
+
+    #[test]
+    fn next_stops_at_the_end_when_repeat_is_off() {
+        let (control, inbox) = playback_with(queued("abc", 0));
+        *control.shared.current_id.lock().unwrap() = "c".to_owned();
+        control.next();
+        assert!(inbox.try_recv().is_err());
+        assert_eq!(*control.shared.current_id.lock().unwrap(), "c");
+    }
+
+    #[test]
+    fn previous_restarts_the_track_past_the_restart_threshold() {
+        let (control, inbox) = playback_with(queued("abc", 0));
+        *control.shared.current_id.lock().unwrap() = "b".to_owned();
+        control.shared.position_ms.store(crate::app::RESTART_AFTER_MS + 1, Relaxed);
+        control.previous();
+        match inbox.try_recv() {
+            Ok(Cmd::Seek { ms, .. }) => assert_eq!(ms, 0),
+            _ => panic!("expected a seek to zero"),
+        }
+        assert_eq!(*control.shared.current_id.lock().unwrap(), "b");
+    }
+
+    #[test]
+    fn pause_flips_the_shared_flag_without_frames() {
+        let (control, _) = playback_with(queued("", 0));
+        control.set_paused(true);
+        assert!(control.paused());
+        control.toggle();
+        assert!(control.paused(), "toggle with nothing loaded stays put");
+        *control.shared.current_id.lock().unwrap() = "a".to_owned();
+        control.toggle();
+        assert!(!control.paused());
     }
 }

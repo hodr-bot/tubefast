@@ -1,5 +1,4 @@
 use crate::app::Action;
-#[cfg(all(unix, not(target_os = "macos")))]
 use crate::player::Playback;
 use crate::ytm::Item;
 
@@ -12,7 +11,7 @@ pub struct Media {
 
 #[cfg(windows)]
 impl Media {
-    pub fn new(cc: &eframe::CreationContext<'_>, press: impl Fn(Action) + Send + 'static) -> Option<Self> {
+    pub fn new(cc: &eframe::CreationContext<'_>, press: impl Fn(Action) + Send + 'static, _control: Playback) -> Option<Self> {
         use raw_window_handle::{HasWindowHandle, RawWindowHandle};
         use windows::Foundation::TypedEventHandler;
         use windows::Media::{
@@ -99,7 +98,7 @@ pub struct Media {
 
 #[cfg(target_os = "macos")]
 impl Media {
-    pub fn new(cc: &eframe::CreationContext<'_>, press: impl Fn(Action) + Send + 'static) -> Option<Self> {
+    pub fn new(cc: &eframe::CreationContext<'_>, press: impl Fn(Action) + Send + 'static, _control: Playback) -> Option<Self> {
         use block2::RcBlock;
         use objc2_media_player::{
             MPChangePlaybackPositionCommandEvent as Scrubbed, MPRemoteCommand, MPRemoteCommandCenter, MPRemoteCommandEvent,
@@ -251,12 +250,12 @@ pub struct Media {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 impl Media {
-    pub fn new(_cc: &eframe::CreationContext<'_>, press: impl Fn(Action) + Send + 'static) -> Option<Self> {
+    pub fn new(_cc: &eframe::CreationContext<'_>, _press: impl Fn(Action) + Send + 'static, control: Playback) -> Option<Self> {
         let (updates, received) = async_channel::unbounded();
         std::thread::Builder::new()
             .name("mpris".to_owned())
             .spawn(move || {
-                if let Err(error) = futures_lite::future::block_on(serve(press, received)) {
+                if let Err(error) = futures_lite::future::block_on(serve(control, received)) {
                     eprintln!("Media keys are off, MPRIS is not available: {error}");
                 }
             })
@@ -341,7 +340,9 @@ impl Media {
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-async fn serve(press: impl Fn(Action) + 'static, updates: async_channel::Receiver<Update>) -> mpris_server::zbus::Result<()> {
+/// The commands run straight on the player handle — no UI frames needed.
+/// The desktop widget therefore works with the window hidden or minimised.
+async fn serve(control: Playback, updates: async_channel::Receiver<Update>) -> mpris_server::zbus::Result<()> {
     use mpris_server::{Player, Time};
 
     let player = Player::builder(&format!("tubefast.instance{}", std::process::id()))
@@ -354,25 +355,24 @@ async fn serve(press: impl Fn(Action) + 'static, updates: async_channel::Receive
         .can_seek(true)
         .build()
         .await?;
-    let press = std::rc::Rc::new(press);
-    let on = |action: fn() -> Action| {
-        let press = press.clone();
-        move |_: &Player| press(action())
+    let queue = std::sync::Arc::new(control);
+    let on = |run: fn(&Playback)| {
+        let queue = queue.clone();
+        move |_: &Player| run(&queue)
     };
-    player.connect_play(on(|| Action::Pause(false)));
-    player.connect_pause(on(|| Action::Pause(true)));
-    player.connect_stop(on(|| Action::Pause(true)));
-    player.connect_play_pause(on(|| Action::Toggle));
-    player.connect_next(on(|| Action::Next));
-    player.connect_previous(on(|| Action::Previous));
-    let seek_to = |to: Time| Action::Seek(to.as_millis().max(0) as u64);
+    player.connect_play(on(|control| control.pause(false)));
+    player.connect_pause(on(|control| control.pause(true)));
+    player.connect_stop(on(|control| control.pause(true)));
+    player.connect_play_pause(on(|control| control.toggle()));
+    player.connect_next(on(|control| control.next()));
+    player.connect_previous(on(|control| control.previous()));
     player.connect_set_position({
-        let press = press.clone();
-        move |_, _, to| press(seek_to(to))
+        let queue = queue.clone();
+        move |_, _, to: Time| queue.seek_to(to.as_millis().max(0) as u64)
     });
     player.connect_seek({
-        let press = press.clone();
-        move |player, by| press(seek_to(player.position() + by))
+        let queue = queue.clone();
+        move |player, by| queue.seek_to((player.position() + by).as_millis().max(0) as u64)
     });
 
     let follow = async {
@@ -424,7 +424,7 @@ pub struct Media;
 
 #[cfg(not(any(windows, unix)))]
 impl Media {
-    pub fn new(_cc: &eframe::CreationContext<'_>, _press: impl Fn(Action) + Send + 'static) -> Option<Self> {
+    pub fn new(_cc: &eframe::CreationContext<'_>, _press: impl Fn(Action) + Send + 'static, _control: Playback) -> Option<Self> {
         None
     }
 
