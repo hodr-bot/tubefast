@@ -360,9 +360,9 @@ async fn serve(control: Playback, updates: async_channel::Receiver<Update>) -> m
         let queue = queue.clone();
         move |_: &Player| run(&queue)
     };
-    player.connect_play(on(|control| control.pause(false)));
-    player.connect_pause(on(|control| control.pause(true)));
-    player.connect_stop(on(|control| control.pause(true)));
+    player.connect_play(on(|control| control.set_paused(false)));
+    player.connect_pause(on(|control| control.set_paused(true)));
+    player.connect_stop(on(|control| control.set_paused(true)));
     player.connect_play_pause(on(|control| control.toggle()));
     player.connect_next(on(|control| control.next()));
     player.connect_previous(on(|control| control.previous()));

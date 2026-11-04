@@ -46,13 +46,12 @@ struct Shared {
     loading: AtomicBool,
     paused: AtomicBool,
     ended: AtomicBool,
+    /// Volume as f32 bits (applied squared). Read by the decode loop when
+    /// it (re)opens the output, which the UI thread never touches.
+    volume: AtomicU32,
     error: Mutex<Option<String>>,
     current_id: Mutex<String>,
     queue: Mutex<Queue>,
-    /// Audio output owned here (not by the UI thread) so pause/volume work
-    /// from any thread, including the MPRIS handler while the window — and
-    /// its frames — are gone.
-    output: Mutex<Option<(rodio::OutputStream, rodio::Sink)>>,
     /// Position to resume from, set once when restoring the saved session.
     /// Consumed by the first play, whoever triggers it (UI or MPRIS).
     resume_at: Mutex<Option<u64>>,
@@ -80,10 +79,34 @@ struct Chunk {
 }
 
 enum Cmd {
-    Load { video_id: String, generation: u64, epoch: u64 },
+    Load {
+        video_id: String,
+        generation: u64,
+        epoch: u64,
+    },
     Opened(Track),
-    Failed { generation: u64, message: String },
-    Seek { ms: u64, epoch: u64 },
+    Failed {
+        generation: u64,
+        message: String,
+    },
+    Seek {
+        ms: u64,
+        epoch: u64,
+    },
+    /// Apply the (already stored) pause flag to the loop-owned sink.
+    Pause {
+        paused: bool,
+    },
+    /// Apply a volume to the loop-owned sink.
+    SetVolume {
+        volume: f32,
+    },
+    /// Recheck the default output device, reopening when it moved.
+    PollDevice,
+    /// Warm the stream cache for a video id without loading it.
+    Preload {
+        video_id: String,
+    },
 }
 
 #[derive(Default)]
@@ -501,15 +524,67 @@ impl rodio::Source for PcmSource {
     }
 }
 
+/// Open the default output, falling back to any stream. Runs on the decode
+/// thread, which then owns the output for its whole lifetime.
+fn open_output(
+    shared: &Arc<Shared>,
+    chunks: &Chunks,
+    wake: &Wake,
+    lost: &Arc<AtomicBool>,
+) -> (Option<(rodio::OutputStream, rodio::Sink)>, Option<String>) {
+    lost.store(false, Relaxed);
+    let flag = lost.clone();
+    let notice_loss = move |error| {
+        flag.fetch_or(matches!(error, rodio::cpal::StreamError::DeviceNotAvailable), Relaxed);
+    };
+    let stream = rodio::OutputStreamBuilder::from_default_device()
+        .and_then(|device| device.with_error_callback(notice_loss).open_stream_or_fallback())
+        .or_else(|_| rodio::OutputStreamBuilder::open_default_stream());
+    let output = stream.ok().map(|mut stream| {
+        stream.log_on_drop(false);
+        let sink = rodio::Sink::connect_new(stream.mixer());
+        let volume = f32::from_bits(shared.volume.load(Relaxed));
+        sink.set_volume(volume * volume);
+        sink.append(PcmSource::new(chunks.clone(), shared.clone(), wake.clone()));
+        (stream, sink)
+    });
+    let device = default_device().filter(|_| output.is_some());
+    (output, device)
+}
+
+/// Apply the shared pause flag to the loop-owned sink.
+fn apply_output(output: &Option<(rodio::OutputStream, rodio::Sink)>, shared: &Arc<Shared>) {
+    if let Some((_, sink)) = output.as_ref() {
+        if shared.paused.load(Relaxed) {
+            sink.pause();
+        } else {
+            sink.play();
+        }
+    }
+}
+
 fn decode_loop(
     commands: Receiver<Cmd>,
     replies: Sender<Cmd>,
     pcm: SyncSender<Chunk>,
+    chunks: Chunks,
     shared: Arc<Shared>,
     yt: Arc<ytm::Client>,
     urls: Urls,
     wake: Wake,
 ) {
+    // The audio output belongs to this thread: opening it here (not on the
+    // UI thread, not in shared state) is what lets pause/volume/device work
+    // on every OS, including ones where the output types are not Send.
+    let lost = Arc::new(AtomicBool::new(false));
+    let (mut output, mut device) = open_output(&shared, &chunks, &wake, &lost);
+    // A fresh start begins paused, as before.
+    shared.paused.store(true, Relaxed);
+    apply_output(&output, &shared);
+    if output.is_none() {
+        *shared.error.lock().unwrap() = Some(NO_OUTPUT.to_owned());
+    }
+    let mut device_polled = Instant::now();
     let mut track: Option<Track> = None;
     let mut pending: Option<Chunk> = None;
     let mut resume: Option<u64> = None;
@@ -589,6 +664,31 @@ fn decode_loop(
                     Some(track) => track.seek(ms),
                     None => resume = Some(ms),
                 }
+            }
+            Some(Cmd::Pause { .. }) => {
+                apply_output(&output, &shared);
+            }
+            Some(Cmd::SetVolume { volume }) => {
+                if let Some((_, sink)) = output.as_ref() {
+                    sink.set_volume(volume * volume);
+                }
+            }
+            Some(Cmd::PollDevice) => {
+                if device_polled.elapsed() >= DEVICE_POLL {
+                    device_polled = Instant::now();
+                    if default_device() != device || lost.load(Relaxed) {
+                        let had_output = output.take().is_some();
+                        (output, device) = open_output(&shared, &chunks, &wake, &lost);
+                        apply_output(&output, &shared);
+                        if had_output && output.is_none() {
+                            *shared.error.lock().unwrap() = Some(NO_OUTPUT.to_owned());
+                        }
+                    }
+                }
+            }
+            Some(Cmd::Preload { video_id }) => {
+                let (yt, urls) = (yt.clone(), urls.clone());
+                std::thread::spawn(move || resolve(&yt, &urls, &video_id));
             }
             _ => {}
         }
@@ -715,12 +815,7 @@ fn default_device() -> Option<String> {
 pub struct Player {
     commands: Sender<Cmd>,
     shared: Arc<Shared>,
-    device: Option<String>,
-    device_lost: Arc<AtomicBool>,
-    device_polled: Instant,
-    chunks: Chunks,
     wake: Wake,
-    volume: f32,
     yt: Arc<ytm::Client>,
     urls: Urls,
 }
@@ -746,19 +841,11 @@ fn start_track(commands: &Sender<Cmd>, shared: &Arc<Shared>, video_id: &str) {
     });
 }
 
-/// Applies a pause state to the flag and the sink together, from any
-/// thread. The UI and MPRIS both go through here, so they can never
-/// disagree about whether audio is playing.
-fn apply_pause(shared: &Arc<Shared>, paused: bool) {
-    shared.paused.store(paused, Relaxed);
-    if let Some((_, sink)) = shared.output.lock().unwrap().as_ref() {
-        if paused { sink.pause() } else { sink.play() }
-    }
-}
-
 /// Neighbour of `video_id` in the queue snapshot, honouring repeat-all
 /// wraparound. Repeat-one never reaches here (it restarts in place).
 /// Returns `None` past the ends when repeat is off.
+/// Only used by the Linux MPRIS integration (background next/previous).
+#[cfg(all(unix, not(target_os = "macos")))]
 fn neighbor(queue: &Queue, video_id: &str, delta: i64) -> Option<String> {
     let at = queue.items.iter().position(|item| item.video_id == video_id)?;
     let len = queue.items.len() as i64;
@@ -782,23 +869,26 @@ fn neighbor(queue: &Queue, video_id: &str, delta: i64) -> Option<String> {
 pub struct Playback {
     commands: Sender<Cmd>,
     shared: Arc<Shared>,
-    yt: Arc<ytm::Client>,
-    urls: Urls,
 }
 
 impl Playback {
+    /// Linux MPRIS only: position/queue readers below are unused elsewhere.
+    #[cfg(all(unix, not(target_os = "macos")))]
     pub fn position_ms(&self) -> u64 {
         self.shared.position_ms.load(Relaxed)
     }
 
+    #[cfg(all(unix, not(target_os = "macos")))]
     pub fn duration_ms(&self) -> u64 {
         self.shared.duration_ms.load(Relaxed)
     }
 
+    #[cfg(all(unix, not(target_os = "macos")))]
     pub fn paused(&self) -> bool {
         self.shared.paused.load(Relaxed)
     }
 
+    #[cfg(all(unix, not(target_os = "macos")))]
     pub fn playing(&self) -> bool {
         !self.chained_id().is_empty() && !self.paused()
     }
@@ -806,16 +896,19 @@ impl Playback {
     /// Set when the audio of the current track really ran out. Unlike
     /// `take_ended` this only peeks, so the UI thread still gets its own
     /// notification when it wakes up.
+    #[cfg(all(unix, not(target_os = "macos")))]
     pub fn ended(&self) -> bool {
         self.shared.ended.load(Relaxed)
     }
 
     /// Video id the decode thread is currently on (or loading).
+    #[cfg(all(unix, not(target_os = "macos")))]
     pub fn chained_id(&self) -> String {
         self.shared.current_id.lock().unwrap().clone()
     }
 
     /// Queue item behind a video id, if the UI snapshot knows it.
+    #[cfg(all(unix, not(target_os = "macos")))]
     pub fn queued_item(&self, video_id: &str) -> Option<ytm::Item> {
         self.shared
             .queue
@@ -839,13 +932,18 @@ impl Playback {
         let _ = self.commands.send(Cmd::Seek { ms, epoch });
     }
 
+    /// Store the flag instantly (UI icons and MPRIS read it) and let the
+    /// decode loop apply it to the sink it owns.
     pub fn set_paused(&self, paused: bool) {
-        apply_pause(&self.shared, paused);
+        self.shared.paused.store(paused, Relaxed);
+        let _ = self.commands.send(Cmd::Pause { paused });
     }
 
     /// Mirrors the UI toggle: resume a restored session once, otherwise
     /// flip the pause state. No-op when nothing is loaded (the pending
     /// resume is kept for whoever loads first).
+    /// Linux MPRIS only: the other platforms go through UI events.
+    #[cfg(all(unix, not(target_os = "macos")))]
     pub fn toggle(&self) {
         let id = self.chained_id();
         if id.is_empty() {
@@ -859,15 +957,10 @@ impl Playback {
         }
     }
 
-    /// Mirrors the UI pause command: only acts when it would change state.
-    pub fn pause(&self, paused: bool) {
-        if paused == self.playing() {
-            self.toggle();
-        }
-    }
-
     /// Mirrors a manual next: step to the following queue item (wrapping
     /// on repeat-all), doing nothing at the end otherwise.
+    /// Linux MPRIS only: the other platforms go through UI events.
+    #[cfg(all(unix, not(target_os = "macos")))]
     pub fn next(&self) {
         let id = self.chained_id();
         let next = neighbor(&self.shared.queue.lock().unwrap(), &id, 1);
@@ -879,6 +972,8 @@ impl Playback {
 
     /// Mirrors a manual previous: restart the track past the restart
     /// threshold, otherwise step back (or restart at the head).
+    /// Linux MPRIS only: the other platforms go through UI events.
+    #[cfg(all(unix, not(target_os = "macos")))]
     pub fn previous(&self) {
         if self.chained_id().is_empty() {
             return;
@@ -897,13 +992,12 @@ impl Playback {
 
     /// Warm the stream cache for the item after `video_id`, like the UI
     /// does when a track changes, so background steps stay gapless.
+    /// Linux MPRIS only: the other platforms go through UI events.
+    #[cfg(all(unix, not(target_os = "macos")))]
     fn preload_after(&self, video_id: &str, delta: i64) {
         let next = neighbor(&self.shared.queue.lock().unwrap(), video_id, delta);
         if let Some(id) = next {
-            let (yt, urls) = (self.yt.clone(), self.urls.clone());
-            std::thread::spawn(move || {
-                let _ = resolve(&yt, &urls, &id);
-            });
+            let _ = self.commands.send(Cmd::Preload { video_id: id });
         }
     }
 
@@ -923,68 +1017,30 @@ impl Playback {
 impl Player {
     pub fn new(yt: Arc<ytm::Client>, wake: impl Fn() + Send + Sync + 'static) -> Self {
         let wake: Wake = Arc::new(wake);
-        let shared = Arc::new(Shared::default());
+        let shared = Arc::new(Shared {
+            volume: AtomicU32::new(1.0f32.to_bits()),
+            ..Default::default()
+        });
         let urls = Urls::default();
         let (commands, inbox) = mpsc::channel();
         let (pcm, chunks) = mpsc::sync_channel(QUEUED_CHUNKS);
+        let chunks = Arc::new(Mutex::new(chunks));
         let worker = (commands.clone(), shared.clone(), yt.clone(), urls.clone(), wake.clone());
-        std::thread::spawn(move || decode_loop(inbox, worker.0, pcm, worker.1, worker.2, worker.3, worker.4));
-        let mut player = Self {
+        let chunks = chunks.clone();
+        std::thread::spawn(move || decode_loop(inbox, worker.0, pcm, chunks, worker.1, worker.2, worker.3, worker.4));
+        Self {
             commands,
             shared,
-            device: None,
-            device_lost: Arc::default(),
-            device_polled: Instant::now(),
-            chunks: Arc::new(Mutex::new(chunks)),
             wake,
-            volume: 1.0,
             yt,
             urls,
-        };
-        player.open_output();
-        if player.shared.output.lock().unwrap().is_none() {
-            player.shared.paused.store(true, Relaxed);
-            *player.shared.error.lock().unwrap() = Some(NO_OUTPUT.to_owned());
         }
-        player
     }
 
-    fn open_output(&mut self) {
-        self.device_lost.store(false, Relaxed);
-        let lost = self.device_lost.clone();
-        let notice_loss = move |error| {
-            lost.fetch_or(matches!(error, rodio::cpal::StreamError::DeviceNotAvailable), Relaxed);
-        };
-        let stream = rodio::OutputStreamBuilder::from_default_device()
-            .and_then(|device| device.with_error_callback(notice_loss).open_stream_or_fallback())
-            .or_else(|_| rodio::OutputStreamBuilder::open_default_stream());
-        *self.shared.output.lock().unwrap() = stream.ok().map(|mut stream| {
-            stream.log_on_drop(false);
-            let sink = rodio::Sink::connect_new(stream.mixer());
-            sink.pause();
-            self.shared.paused.store(true, Relaxed);
-            sink.set_volume(self.volume * self.volume);
-            sink.append(PcmSource::new(self.chunks.clone(), self.shared.clone(), self.wake.clone()));
-            (stream, sink)
-        });
-        self.device = default_device().filter(|_| self.shared.output.lock().unwrap().is_some());
-    }
-
-    pub fn follow_default_device(&mut self) {
-        if self.device_polled.elapsed() < DEVICE_POLL {
-            return;
-        }
-        self.device_polled = Instant::now();
-        if default_device() == self.device && !self.device_lost.load(Relaxed) {
-            return;
-        }
-        let paused = self.paused();
-        let played = self.shared.output.lock().unwrap().take().is_some();
-        self.open_output();
-        self.set_paused(paused);
-        if played && self.shared.output.lock().unwrap().is_none() {
-            *self.shared.error.lock().unwrap() = Some(NO_OUTPUT.to_owned());
-        }
+    /// Ask the decode loop (which owns the output) to recheck the default
+    /// device. Cheap: the loop throttles to one check per `DEVICE_POLL`.
+    pub fn follow_default_device(&self) {
+        let _ = self.commands.send(Cmd::PollDevice);
     }
 
     pub fn load(&self, video_id: &str) {
@@ -1016,8 +1072,6 @@ impl Player {
         Playback {
             commands: self.commands.clone(),
             shared: self.shared.clone(),
-            yt: self.yt.clone(),
-            urls: self.urls.clone(),
         }
     }
 
@@ -1038,11 +1092,9 @@ impl Player {
         self.shared.paused.load(Relaxed)
     }
 
-    pub fn set_volume(&mut self, volume: f32) {
-        self.volume = volume;
-        if let Some((_, sink)) = self.shared.output.lock().unwrap().as_ref() {
-            sink.set_volume(volume * volume);
-        }
+    pub fn set_volume(&self, volume: f32) {
+        self.shared.volume.store(volume.to_bits(), Relaxed);
+        let _ = self.commands.send(Cmd::SetVolume { volume });
     }
 
     pub fn position_ms(&self) -> u64 {
@@ -1147,6 +1199,8 @@ mod tests {
         assert!(queue(3000));
     }
 
+    /// Linux MPRIS only: these tests cover the gated background controls.
+    #[cfg(all(unix, not(target_os = "macos")))]
     fn queued(ids: &str, repeat: u8) -> Queue {
         Queue {
             items: ids
@@ -1160,20 +1214,17 @@ mod tests {
         }
     }
 
+    #[cfg(all(unix, not(target_os = "macos")))]
     fn playback_with(queue: Queue) -> (Playback, mpsc::Receiver<Cmd>) {
         let shared = Arc::new(Shared::default());
         *shared.queue.lock().unwrap() = queue;
         let (commands, inbox) = mpsc::channel();
-        let control = Playback {
-            commands,
-            shared,
-            yt: Arc::new(ytm::Client::new(String::new())),
-            urls: Urls::default(),
-        };
+        let control = Playback { commands, shared };
         (control, inbox)
     }
 
     #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
     fn queue_neighbours_step_without_wrapping_when_repeat_is_off() {
         let queue = queued("abc", 0);
         assert_eq!(neighbor(&queue, "a", 1).as_deref(), Some("b"));
@@ -1185,6 +1236,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
     fn queue_neighbours_wrap_around_on_repeat_all() {
         let queue = queued("abc", 1);
         assert_eq!(neighbor(&queue, "c", 1).as_deref(), Some("a"));
@@ -1192,6 +1244,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
     fn next_loads_the_following_item_and_preloads_the_one_after() {
         let (control, inbox) = playback_with(queued("abc", 0));
         *control.shared.current_id.lock().unwrap() = "a".to_owned();
@@ -1204,6 +1257,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
     fn next_stops_at_the_end_when_repeat_is_off() {
         let (control, inbox) = playback_with(queued("abc", 0));
         *control.shared.current_id.lock().unwrap() = "c".to_owned();
@@ -1213,6 +1267,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
     fn previous_restarts_the_track_past_the_restart_threshold() {
         let (control, inbox) = playback_with(queued("abc", 0));
         *control.shared.current_id.lock().unwrap() = "b".to_owned();
@@ -1226,6 +1281,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
     fn pause_flips_the_shared_flag_without_frames() {
         let (control, _) = playback_with(queued("", 0));
         control.set_paused(true);
