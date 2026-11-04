@@ -230,6 +230,7 @@ const POSITION_EVERY_MS: u64 = 1000;
 /// How long the ticker waits after the audio ran out before reporting the
 /// track as stopped. Gives a running UI thread the chance to consume the
 /// end first (pause/seek/next), so a visible window never flickers.
+#[cfg(all(unix, not(target_os = "macos")))]
 const ENDED_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[cfg(all(unix, not(target_os = "macos")))]
