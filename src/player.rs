@@ -46,6 +46,7 @@ struct Shared {
     loading: AtomicBool,
     paused: AtomicBool,
     ended: AtomicBool,
+    #[cfg(all(unix, not(target_os = "macos")))]
     paused: AtomicBool,
     error: Mutex<Option<String>>,
     current_id: Mutex<String>,
@@ -723,12 +724,15 @@ pub struct Player {
 /// Thread-safe view of the playback state for background integrations
 /// (the MPRIS ticker) that must keep working while the UI thread is
 /// stalled. Everything is read from the shared state, never from the
-/// audio output owned by the UI thread.
+/// audio output owned by the UI thread. Linux only: other platforms feed
+/// their media integration from the UI thread.
+#[cfg(all(unix, not(target_os = "macos")))]
 #[derive(Clone)]
 pub struct Playback {
     shared: Arc<Shared>,
 }
 
+#[cfg(all(unix, not(target_os = "macos")))]
 impl Playback {
     pub fn position_ms(&self) -> u64 {
         self.shared.position_ms.load(Relaxed)
@@ -790,6 +794,7 @@ impl Player {
             urls,
         };
         player.open_output();
+        #[cfg(all(unix, not(target_os = "macos")))]
         player.shared.paused.store(true, Relaxed);
         if player.output.is_none() {
             *player.shared.error.lock().unwrap() = Some(NO_OUTPUT.to_owned());
@@ -873,6 +878,7 @@ impl Player {
     /// (the MPRIS ticker) that must keep working while the UI thread is
     /// stalled. Everything is read from the shared state, never from the
     /// audio output owned by the UI thread.
+    #[cfg(all(unix, not(target_os = "macos")))]
     pub fn playback(&self) -> Playback {
         Playback {
             shared: self.shared.clone(),
@@ -892,6 +898,7 @@ impl Player {
     }
 
     pub fn set_paused(&self, paused: bool) {
+        #[cfg(all(unix, not(target_os = "macos")))]
         self.shared.paused.store(paused, Relaxed);
         if let Some((_, sink)) = &self.output {
             if paused { sink.pause() } else { sink.play() }
