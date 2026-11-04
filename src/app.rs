@@ -306,6 +306,12 @@ impl App {
                 ctx.request_repaint();
             }
         });
+        // The MPRIS ticker keeps the desktop integration (covers, progress)
+        // in sync while this thread is stalled in the background.
+        #[cfg(all(unix, not(target_os = "macos")))]
+        if let Some(media) = media.as_ref() {
+            media.track(player.playback());
+        }
         let discord = saved.discord.then(|| link_discord(&sender, &ctx));
         let mut app = Self {
             art: Art::new(ctx.clone(), yt.agent.clone()),
@@ -828,8 +834,7 @@ impl App {
             Repeat::All => 1,
             Repeat::One => 2,
         };
-        let ids: Vec<String> = self.saved.queue.iter().map(|item| item.video_id.clone()).collect();
-        self.player.set_queue(&ids, repeat);
+        self.player.set_queue(&self.saved.queue, repeat);
         if let Some(typed) = self.typed {
             if typed.elapsed() >= SEARCH_DEBOUNCE {
                 self.typed = None;

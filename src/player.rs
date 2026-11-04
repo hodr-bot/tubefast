@@ -46,6 +46,7 @@ struct Shared {
     loading: AtomicBool,
     paused: AtomicBool,
     ended: AtomicBool,
+    paused: AtomicBool,
     error: Mutex<Option<String>>,
     current_id: Mutex<String>,
     queue: Mutex<Queue>,
@@ -54,9 +55,11 @@ struct Shared {
 /// Snapshot of the UI queue so the decode thread can advance on its own
 /// when the UI thread is stalled (a minimised or hidden window stops
 /// eframe redraws on Wayland, which used to gate every auto-advance).
+/// Full items (not just ids) so background integrations like the MPRIS
+/// ticker can resolve titles and covers without the UI thread.
 #[derive(Default)]
 struct Queue {
-    ids: Vec<String>,
+    items: Vec<ytm::Item>,
     /// 0 = off, 1 = repeat all, 2 = repeat one.
     repeat: u8,
 }
@@ -610,10 +613,10 @@ fn decode_loop(
                     } else {
                         let next = {
                             let queue = shared.queue.lock().unwrap();
-                            let at = queue.ids.iter().position(|id| *id == video_id);
+                            let at = queue.items.iter().position(|item| item.video_id == video_id);
                             match at {
-                                Some(i) if i + 1 < queue.ids.len() => Some(queue.ids[i + 1].clone()),
-                                _ if queue.repeat == 1 && !queue.ids.is_empty() => Some(queue.ids[0].clone()),
+                                Some(i) if i + 1 < queue.items.len() => Some(queue.items[i + 1].video_id.clone()),
+                                _ if queue.repeat == 1 && !queue.items.is_empty() => Some(queue.items[0].video_id.clone()),
                                 _ => None,
                             }
                         };
@@ -659,10 +662,10 @@ fn decode_loop(
                                 let follow = {
                                     let queue = warm_shared.queue.lock().unwrap();
                                     queue
-                                        .ids
+                                        .items
                                         .iter()
-                                        .position(|id| *id == warm_id)
-                                        .and_then(|i| queue.ids.get(i + 1).cloned())
+                                        .position(|item| item.video_id == warm_id)
+                                        .and_then(|i| queue.items.get(i + 1).map(|item| item.video_id.clone()))
                                 };
                                 if let Some(id) = follow {
                                     let _ = resolve(&warm_yt, &warm_urls, &id);
@@ -717,6 +720,53 @@ pub struct Player {
     urls: Urls,
 }
 
+/// Thread-safe view of the playback state for background integrations
+/// (the MPRIS ticker) that must keep working while the UI thread is
+/// stalled. Everything is read from the shared state, never from the
+/// audio output owned by the UI thread.
+#[derive(Clone)]
+pub struct Playback {
+    shared: Arc<Shared>,
+}
+
+impl Playback {
+    pub fn position_ms(&self) -> u64 {
+        self.shared.position_ms.load(Relaxed)
+    }
+
+    pub fn duration_ms(&self) -> u64 {
+        self.shared.duration_ms.load(Relaxed)
+    }
+
+    pub fn paused(&self) -> bool {
+        self.shared.paused.load(Relaxed)
+    }
+
+    /// Set when the audio of the current track really ran out. Unlike
+    /// `take_ended` this only peeks, so the UI thread still gets its own
+    /// notification when it wakes up.
+    pub fn ended(&self) -> bool {
+        self.shared.ended.load(Relaxed)
+    }
+
+    /// Video id the decode thread is currently on (or loading).
+    pub fn chained_id(&self) -> String {
+        self.shared.current_id.lock().unwrap().clone()
+    }
+
+    /// Queue item behind a video id, if the UI snapshot knows it.
+    pub fn queued_item(&self, video_id: &str) -> Option<ytm::Item> {
+        self.shared
+            .queue
+            .lock()
+            .unwrap()
+            .items
+            .iter()
+            .find(|item| item.video_id == video_id)
+            .cloned()
+    }
+}
+
 impl Player {
     pub fn new(yt: Arc<ytm::Client>, wake: impl Fn() + Send + Sync + 'static) -> Self {
         let wake: Wake = Arc::new(wake);
@@ -740,6 +790,7 @@ impl Player {
             urls,
         };
         player.open_output();
+        player.shared.paused.store(true, Relaxed);
         if player.output.is_none() {
             *player.shared.error.lock().unwrap() = Some(NO_OUTPUT.to_owned());
         }
@@ -811,8 +862,21 @@ impl Player {
     /// next track on its own when the UI thread is stalled (a minimised or
     /// hidden window stops eframe redraws on Wayland). `repeat`: 0 = off,
     /// 1 = repeat all, 2 = repeat one.
-    pub fn set_queue(&self, ids: &[String], repeat: u8) {
-        *self.shared.queue.lock().unwrap() = Queue { ids: ids.to_vec(), repeat };
+    pub fn set_queue(&self, items: &[ytm::Item], repeat: u8) {
+        *self.shared.queue.lock().unwrap() = Queue {
+            items: items.to_vec(),
+            repeat,
+        };
+    }
+
+    /// Thread-safe view of the playback state for background integrations
+    /// (the MPRIS ticker) that must keep working while the UI thread is
+    /// stalled. Everything is read from the shared state, never from the
+    /// audio output owned by the UI thread.
+    pub fn playback(&self) -> Playback {
+        Playback {
+            shared: self.shared.clone(),
+        }
     }
 
     /// Video id the decode thread is currently on (or loading).

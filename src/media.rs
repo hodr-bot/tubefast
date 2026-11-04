@@ -1,4 +1,6 @@
 use crate::app::Action;
+#[cfg(all(unix, not(target_os = "macos")))]
+use crate::player::Playback;
 use crate::ytm::Item;
 
 #[cfg(windows)]
@@ -225,6 +227,10 @@ fn publish(item: Option<&Item>, playing: bool, position_ms: u64, duration_ms: u6
 
 #[cfg(all(unix, not(target_os = "macos")))]
 const POSITION_EVERY_MS: u64 = 1000;
+/// How long the ticker waits after the audio ran out before reporting the
+/// track as stopped. Gives a running UI thread the chance to consume the
+/// end first (pause/seek/next), so a visible window never flickers.
+const ENDED_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[cfg(all(unix, not(target_os = "macos")))]
 struct Update {
@@ -279,6 +285,57 @@ impl Media {
             duration_ms,
             seeked,
         });
+    }
+
+    /// Starts a background ticker that keeps MPRIS in sync while the UI
+    /// thread is stalled (a minimised or hidden window stops eframe
+    /// redraws on Wayland, so `show()` stops being called). It applies the
+    /// same throttle as `show()` and feeds the same channel; the MPRIS
+    /// side already ignores duplicate states, so both senders converge.
+    pub fn track(&self, playback: Playback) {
+        let updates = self.updates.clone();
+        std::thread::Builder::new()
+            .name("mpris-sync".to_owned())
+            .spawn(move || {
+                let mut shown = (String::new(), false, 0u64);
+                let mut at = (std::time::Instant::now(), 0u64);
+                let mut ended_since: Option<std::time::Instant> = None;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(POSITION_EVERY_MS));
+                    let id = playback.chained_id();
+                    let mut item = if id.is_empty() { None } else { playback.queued_item(&id) };
+                    if playback.ended() {
+                        if ended_since.is_none() {
+                            ended_since = Some(std::time::Instant::now());
+                        }
+                        if ended_since.is_some_and(|since| since.elapsed() >= ENDED_GRACE) {
+                            item = None;
+                        }
+                    } else {
+                        ended_since = None;
+                    }
+                    let playing = item.is_some() && !playback.paused();
+                    let (position_ms, duration_ms) = (playback.position_ms(), playback.duration_ms());
+                    let elapsed = at.0.elapsed().as_millis() as u64;
+                    let expected = at.1 + if shown.1 { elapsed } else { 0 };
+                    let jumped = expected.abs_diff(position_ms) >= SEEK_SLACK_MS;
+                    let track = item.as_ref().map_or("", |item| item.video_id.as_str());
+                    let current = (track.to_owned(), playing, duration_ms);
+                    if shown == current && !jumped && (!playing || elapsed < POSITION_EVERY_MS) {
+                        continue;
+                    }
+                    let seeked = shown.0 == current.0 && jumped;
+                    (shown, at) = (current, (std::time::Instant::now(), position_ms));
+                    let _ = updates.try_send(Update {
+                        item,
+                        playing,
+                        position_ms,
+                        duration_ms,
+                        seeked,
+                    });
+                }
+            })
+            .ok();
     }
 }
 
