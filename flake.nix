@@ -22,7 +22,7 @@
           tubefast = pkgs.rustPlatform.buildRustPackage {
             pname = "tubefast";
             # Keep in sync with Cargo.toml.
-            version = "0.6.0";
+            version = "0.7.1";
             src = self;
             cargoLock = { lockFile = ./Cargo.lock; };
             # Refresh with: nix build .#tubefast (paste the expected hash from the error).

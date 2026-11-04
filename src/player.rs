@@ -46,8 +46,6 @@ struct Shared {
     loading: AtomicBool,
     paused: AtomicBool,
     ended: AtomicBool,
-    #[cfg(all(unix, not(target_os = "macos")))]
-    paused: AtomicBool,
     error: Mutex<Option<String>>,
     current_id: Mutex<String>,
     queue: Mutex<Queue>,
@@ -794,8 +792,6 @@ impl Player {
             urls,
         };
         player.open_output();
-        #[cfg(all(unix, not(target_os = "macos")))]
-        player.shared.paused.store(true, Relaxed);
         if player.output.is_none() {
             *player.shared.error.lock().unwrap() = Some(NO_OUTPUT.to_owned());
         }
@@ -898,7 +894,6 @@ impl Player {
     }
 
     pub fn set_paused(&self, paused: bool) {
-        #[cfg(all(unix, not(target_os = "macos")))]
         self.shared.paused.store(paused, Relaxed);
         if let Some((_, sink)) = &self.output {
             if paused { sink.pause() } else { sink.play() }

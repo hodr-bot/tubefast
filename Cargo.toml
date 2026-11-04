@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.90"
 license = "MIT"
 description = "YouTube Music, native and fast. A lightweight desktop client with no browser engine."
-repository = "https://github.com/yigitbozyaka/tubefast"
+repository = "https://github.com/hodr-bot/tubefast"
 keywords = ["youtube-music", "music", "player", "egui", "desktop"]
 categories = ["multimedia::audio"]
 
